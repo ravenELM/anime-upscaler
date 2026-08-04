@@ -265,6 +265,7 @@ export default function App() {
             // Start upscaler and play video to record
             upscaler.start();
             video.muted = true;
+            video.loop = false;
             video.currentTime = 0;
             video.play();
             setIsPlaying(true);
@@ -443,6 +444,12 @@ export default function App() {
                                 <button onClick={() => setModel('anime4k-c')} className={`px-4 py-2.5 rounded-lg text-sm font-medium transition-colors text-left ${model === 'anime4k-c' ? 'bg-[#00d2ff] text-black' : 'bg-black/40 text-neutral-300 hover:bg-black/60'}`}>Anime4K Max (Slow)</button>
                                 <button onClick={() => setModel('gan-restore')} className={`px-4 py-2.5 rounded-lg text-sm font-medium transition-colors text-left ${model === 'gan-restore' ? 'bg-[#00d2ff] text-black' : 'bg-black/40 text-neutral-300 hover:bg-black/60'}`}>GAN Restore (Advanced)</button>
                              </div>
+                             {model === 'gan-restore' && (
+                               <div className="mt-2 p-3 bg-indigo-900/30 border border-indigo-500/30 rounded-lg text-xs text-indigo-200 leading-relaxed">
+                                 <strong>GAN Restore</strong> uses a Generative Adversarial Network (AI) to restore and upscale directly in your browser. 
+                                 <em>Note: Truly heavy-duty studio-quality AI upscaling (like Real-ESRGAN or Topaz) requires a backend with heavy GPUs. Since this app runs in the browser/Vercel without heavy GPU backends, this is the most advanced on-device AI model available here.</em>
+                               </div>
+                             )}
                            </div>
                            
                            {fileType === 'image' && (
@@ -453,12 +460,12 @@ export default function App() {
                                </label>
                                <input 
                                  type="range" 
-                                 min="1" max="10" 
+                                 min="1" max="100" 
                                  value={iterations} 
                                  onChange={(e) => setIterations(parseInt(e.target.value))}
                                  className="w-full accent-[#00d2ff]"
                                />
-                               <p className="text-[11px] text-neutral-500">Run the upscaler multiple times for intense sharpness.</p>
+                               <p className="text-[11px] text-neutral-500">Run the upscaler multiple times for intense sharpness.</p>{iterations > 20 && <p className="text-[11px] text-amber-500 mt-1">Warning: High passes will take significantly longer to process and may freeze the browser.</p>}
                              </div>
                            )}
                         </div>
@@ -555,7 +562,7 @@ export default function App() {
                           src={fileUrl}
                           className={`w-full h-full object-contain ${status === 'completed' ? 'block' : 'hidden'}`}
                           muted
-                          loop
+                          loop={status === 'completed'}
                           playsInline
                         />
                       </div>
