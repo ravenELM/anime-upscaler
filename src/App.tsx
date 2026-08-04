@@ -269,85 +269,119 @@ export default function App() {
           }
         };
       } else if (fileType === 'video') {
-        if (videoRefOriginal.current && canvasRefEnhanced.current) {
-          const initVideoUpscaler = () => {
+          const startVideoProcess = () => {
             if (isCancelled) return;
-            const video = videoRefOriginal.current!;
-            const canvas = canvasRefEnhanced.current!;
+            const video = videoRefOriginal.current;
+            const canvas = canvasRefEnhanced.current;
             const canvasOrig = canvasRefOriginal.current;
-            
-            const VideoUpscalerClass = unwrap(VideoUpscaler);
-            const upscaler = new VideoUpscalerClass(preset, targetFps);
-            upscalerRef.current = upscaler;
-            
-            upscaler.attachVideo(video, canvas);
-            
-            const estimatedFrames = Math.round(video.duration * targetFps) || 0;
-            setTotalFrames(estimatedFrames);
-            
-            // Motion blur / Twixtor temporal frame synthesis canvas buffer
-            let prevCanvas: HTMLCanvasElement | null = null;
-            if (motionBlur || fpsMode !== 'native') {
-              prevCanvas = document.createElement('canvas');
-            }
+            if (!video || !canvas) return;
 
-            // Determine supported MIME type for requested videoFormat
-            let mimeType = 'video/mp4';
-            if (videoFormat === 'mp4') {
-              if (MediaRecorder.isTypeSupported('video/mp4;codecs=avc1')) {
-                mimeType = 'video/mp4;codecs=avc1';
-              } else if (MediaRecorder.isTypeSupported('video/mp4')) {
-                mimeType = 'video/mp4';
-              } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
-                mimeType = 'video/webm;codecs=vp9';
-              } else {
-                mimeType = 'video/webm';
-              }
-            } else {
-              if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
-                mimeType = 'video/webm;codecs=vp9';
-              } else if (MediaRecorder.isTypeSupported('video/webm')) {
-                mimeType = 'video/webm';
-              } else {
-                mimeType = 'video/mp4';
-              }
-            }
-            setRecordedMimeType(mimeType);
+            const initVideoUpscaler = () => {
+              if (isCancelled) return;
 
-            // Setup MediaRecorder
-            try {
-              recordedChunks.current = [];
-              const stream = canvas.captureStream(targetFps);
-              const mediaRecorder = new MediaRecorder(stream, { mimeType });
-              mediaRecorderRef.current = mediaRecorder;
-              
-              mediaRecorder.ondataavailable = (e) => {
-                if (e.data.size > 0) {
-                  recordedChunks.current.push(e.data);
+              const estimatedFrames = Math.round((video.duration || 1) * targetFps) || 1;
+              setTotalFrames(estimatedFrames);
+
+              let mimeType = 'video/mp4';
+              if (videoFormat === 'mp4') {
+                if (MediaRecorder.isTypeSupported('video/mp4;codecs=avc1')) {
+                  mimeType = 'video/mp4;codecs=avc1';
+                } else if (MediaRecorder.isTypeSupported('video/mp4')) {
+                  mimeType = 'video/mp4';
+                } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+                  mimeType = 'video/webm;codecs=vp9';
+                } else {
+                  mimeType = 'video/webm';
                 }
-              };
-              
-              mediaRecorder.onstop = () => {
-                const blob = new Blob(recordedChunks.current, { type: mimeType });
-                const url = URL.createObjectURL(blob);
-                setRecordedBlobUrl(url);
-              };
-              
-              mediaRecorder.start();
-            } catch (err) {
-              console.error('MediaRecorder initialization failed:', err);
-            }
+              } else {
+                if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+                  mimeType = 'video/webm;codecs=vp9';
+                } else if (MediaRecorder.isTypeSupported('video/webm')) {
+                  mimeType = 'video/webm';
+                } else {
+                  mimeType = 'video/mp4';
+                }
+              }
+              setRecordedMimeType(mimeType);
 
-            // Sync original canvas loop & motion blur effect
-            const syncCanvas = () => {
-              if (!syncRunning) return;
-              if (canvasOrig && video) {
-                const ctx = canvasOrig.getContext('2d');
-                if (ctx) {
-                  const vw = video.videoWidth;
-                  const vh = video.videoHeight;
-                  if (vw && vh) {
-                    if (canvasOrig.width !== vw) {
+              // Setup MediaRecorder capturing from the main canvas
+              try {
+                recordedChunks.current = [];
+                const stream = canvas.captureStream(targetFps);
+                const mediaRecorder = new MediaRecorder(stream, { mimeType });
+                mediaRecorderRef.current = mediaRecorder;
+                
+                mediaRecorder.ondataavailable = (e) => {
+                  if (e.data.size > 0) {
+                    recordedChunks.current.push(e.data);
+                  }
+                };
+                
+                mediaRecorder.onstop = () => {
+                  const blob = new Blob(recordedChunks.current, { type: mimeType });
+                  const url = URL.createObjectURL(blob);
+                  setRecordedBlobUrl(url);
+                };
+                
+                mediaRecorder.start(100);
+              } catch (err) {
+                console.error('MediaRecorder initialization failed:', err);
+              }
+
+              // Try OffscreenCanvas transfer to Worker for off-thread WebGL processing
+              let worker: Worker | null = null;
+              let isOffscreenTransferred = false;
+              let fallbackUpscaler: any = null;
+
+              const presetNameMap: Record<ModelMode, string> = {
+                'anime4k-a-fast': 'ANIME4K_HIGHEREND_MODE_A_FAST',
+                'anime4k-a': 'ANIME4K_HIGHEREND_MODE_A',
+                'anime4k-c': 'ANIME4K_HIGHEREND_MODE_C',
+                'gan-restore': 'Anime4K_Restore_GAN_UUL',
+              };
+
+              if (typeof (canvas as any).transferControlToOffscreen === 'function') {
+                try {
+                  const offscreen = (canvas as any).transferControlToOffscreen();
+                  worker = new Worker(new URL('./workers/upscaleWorker.ts', import.meta.url), { type: 'module' });
+                  upscalerRef.current = { stop: () => worker?.terminate() };
+
+                  worker.postMessage({
+                    type: 'init',
+                    canvas: offscreen,
+                    presetName: presetNameMap[model] || 'ANIME4K_HIGHEREND_MODE_A_FAST',
+                    denoise,
+                    width: video.videoWidth * 2,
+                    height: video.videoHeight * 2
+                  }, [offscreen]);
+
+                  isOffscreenTransferred = true;
+                } catch (err) {
+                  console.warn('OffscreenCanvas transfer failed, using fallback main thread rendering:', err);
+                  isOffscreenTransferred = false;
+                }
+              }
+
+              if (!isOffscreenTransferred) {
+                const VideoUpscalerClass = unwrap(VideoUpscaler);
+                fallbackUpscaler = new VideoUpscalerClass(preset, targetFps);
+                upscalerRef.current = fallbackUpscaler;
+                fallbackUpscaler.attachVideo(video, canvas);
+                fallbackUpscaler.start();
+              }
+
+              // Sync original video preview & send frame bitmaps to worker offscreen canvas
+              let isProcessingFrame = false;
+              const processFrameLoop = async () => {
+                if (!syncRunning || isCancelled) return;
+
+                const vw = video.videoWidth;
+                const vh = video.videoHeight;
+
+                if (canvasOrig && vw && vh) {
+                  const ctx = canvasOrig.getContext('2d');
+                  if (ctx) {
+                    if (canvasOrig.width !== vw || canvasOrig.height !== vh) {
                       canvasOrig.width = vw;
                       canvasOrig.height = vh;
                       setFileDetails(prev => prev ? { ...prev, dimensions: `${vw} × ${vh}` } : null);
@@ -355,69 +389,75 @@ export default function App() {
                     ctx.drawImage(video, 0, 0, vw, vh);
                   }
                 }
-              }
 
-              // Motion blur & Twixtor AI temporal frame synthesis pass
-              if ((motionBlur || fpsMode !== 'native') && canvas) {
-                const ctx = canvas.getContext('2d');
-                if (ctx && prevCanvas) {
-                  if (prevCanvas.width !== canvas.width || prevCanvas.height !== canvas.height) {
-                    prevCanvas.width = canvas.width;
-                    prevCanvas.height = canvas.height;
-                  }
-                  const pCtx = prevCanvas.getContext('2d');
-                  if (pCtx) {
-                    const blendAlpha = motionBlur ? 0.35 : 0.20;
-                    ctx.globalAlpha = blendAlpha;
-                    ctx.drawImage(prevCanvas, 0, 0);
-                    ctx.globalAlpha = 1.0;
-                    pCtx.drawImage(canvas, 0, 0);
+                if (isOffscreenTransferred && worker && !isProcessingFrame && video.readyState >= 2) {
+                  try {
+                    isProcessingFrame = true;
+                    const bitmap = await createImageBitmap(video);
+                    worker.postMessage({
+                      type: 'processFrame',
+                      imageBitmap: bitmap,
+                      targetWidth: (vw || 640) * 2,
+                      targetHeight: (vh || 360) * 2
+                    }, [bitmap]);
+                  } catch (e) {
+                    console.warn('Frame bitmap creation error:', e);
+                  } finally {
+                    isProcessingFrame = false;
                   }
                 }
-              }
 
-              requestAnimationFrame(syncCanvas);
-            };
-            requestAnimationFrame(syncCanvas);
+                requestAnimationFrame(processFrameLoop);
+              };
 
-            // Start upscaler and play video to record
-            upscaler.start();
-            video.muted = true;
-            video.loop = false;
-            video.currentTime = 0;
-            video.play();
-            setIsPlaying(true);
+              requestAnimationFrame(processFrameLoop);
 
-            const checkProgress = () => {
-              if (isCancelled) return;
-              if (video.ended || video.currentTime >= video.duration) {
-                syncRunning = false;
-                upscaler.stop();
-                setProgress(100);
-                setCurrentFrame(estimatedFrames);
-                setStatus('completed');
-                setIsPlaying(false);
-                video.pause();
-                
-                if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-                  mediaRecorderRef.current.stop();
+              video.muted = true;
+              video.loop = false;
+              video.currentTime = 0;
+              video.play().catch(err => console.warn('Video play prevented:', err));
+              setIsPlaying(true);
+
+              const checkProgress = () => {
+                if (isCancelled) return;
+                if (video.ended || video.currentTime >= video.duration) {
+                  syncRunning = false;
+                  if (fallbackUpscaler) fallbackUpscaler.stop();
+                  if (worker) worker.postMessage({ type: 'destroy' });
+                  setProgress(100);
+                  setCurrentFrame(estimatedFrames);
+                  setStatus('completed');
+                  setIsPlaying(false);
+                  video.pause();
+                  
+                  if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+                    mediaRecorderRef.current.stop();
+                  }
+                } else {
+                  const p = (video.currentTime / (video.duration || 1)) * 100;
+                  setProgress(Math.min(100, Math.max(0, p)));
+                  setCurrentFrame(Math.round(video.currentTime * targetFps));
+                  requestAnimationFrame(checkProgress);
                 }
-              } else {
-                const p = (video.currentTime / video.duration) * 100;
-                setProgress(p);
-                setCurrentFrame(Math.round(video.currentTime * targetFps));
-                requestAnimationFrame(checkProgress);
-              }
+              };
+              requestAnimationFrame(checkProgress);
             };
-            requestAnimationFrame(checkProgress);
+
+            if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+              initVideoUpscaler();
+            } else {
+              const handleLoaded = () => {
+                video.removeEventListener('loadeddata', handleLoaded);
+                video.removeEventListener('canplay', handleLoaded);
+                initVideoUpscaler();
+              };
+              video.addEventListener('loadeddata', handleLoaded);
+              video.addEventListener('canplay', handleLoaded);
+              video.load();
+            }
           };
 
-          if (videoRefOriginal.current.readyState >= 1) {
-            initVideoUpscaler();
-          } else {
-            videoRefOriginal.current.onloadedmetadata = initVideoUpscaler;
-          }
-        }
+          startVideoProcess();
       }
     };
     
@@ -610,7 +650,15 @@ export default function App() {
                      {fileType === 'image' ? (
                         <img src={fileUrl} alt="Preview" className="max-w-full max-h-full object-contain rounded-lg shadow-2xl" />
                      ) : (
-                        <video src={fileUrl} className="max-w-full max-h-full object-contain rounded-lg shadow-2xl" muted loop playsInline autoPlay />
+                        <video 
+                          ref={videoRefOriginal}
+                          src={fileUrl} 
+                          className="max-w-full max-h-full object-contain rounded-lg shadow-2xl" 
+                          muted 
+                          loop 
+                          playsInline 
+                          autoPlay 
+                        />
                      )}
                    </div>
                 ) : (
@@ -634,6 +682,7 @@ export default function App() {
                                muted
                                loop
                                playsInline
+                               autoPlay
                              />
                            ) : (
                              <canvas 
@@ -652,7 +701,7 @@ export default function App() {
                            style={{ objectFit: 'contain' }}
                          />
                        ) : (
-                         <div className="w-full h-full flex items-center justify-center bg-black">
+                         <div className="w-full h-full flex items-center justify-center bg-black relative overflow-hidden">
                            <canvas 
                              ref={canvasRefOriginal}
                              className={`max-w-full max-h-full object-contain ${status === 'completed' ? 'hidden' : 'block'}`}
@@ -660,7 +709,11 @@ export default function App() {
                            <video 
                              ref={videoRefOriginal}
                              src={fileUrl}
-                             className={`max-w-full max-h-full object-contain ${status === 'completed' ? 'block' : 'hidden'}`}
+                             className={`max-w-full max-h-full object-contain ${
+                               status === 'completed'
+                                 ? 'block relative'
+                                 : 'block absolute inset-0 pointer-events-none opacity-100'
+                             }`}
                              muted
                              loop={status === 'completed'}
                              playsInline
