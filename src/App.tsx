@@ -17,8 +17,64 @@ const unwrap = (s: any) => (s && s.default ? s.default : s);
 type UpscaleMode = 'image' | 'video' | null;
 type ModelMode = 'anime4k-a-fast' | 'anime4k-a' | 'anime4k-c' | 'gan-restore';
 type ProcessStatus = 'idle' | 'enhancing' | 'completed';
-type VideoFormat = 'mp4' | 'webm';
+type VideoFormat = 'mp4' | 'webm' | 'wav';
 type FpsMode = 'native' | '60fps' | '120fps';
+
+function audioBufferToWav(buffer: AudioBuffer): Blob {
+  const numOfChan = buffer.numberOfChannels;
+  const length = buffer.length * numOfChan * 2 + 44;
+  const out = new DataView(new ArrayBuffer(length));
+  let channels: Float32Array[] = [];
+  let sampleRate = buffer.sampleRate;
+  let pos = 0;
+
+  function writeString(str: string) {
+    for (let i = 0; i < str.length; i++) {
+      out.setUint8(pos++, str.charCodeAt(i));
+    }
+  }
+
+  function setUint16(data: number) {
+    out.setUint16(pos, data, true);
+    pos += 2;
+  }
+
+  function setUint32(data: number) {
+    out.setUint32(pos, data, true);
+    pos += 4;
+  }
+
+  writeString('RIFF');
+  setUint32(length - 8);
+  writeString('WAVE');
+  writeString('fmt ');
+  setUint32(16);
+  setUint16(1);
+  setUint16(numOfChan);
+  setUint32(sampleRate);
+  setUint32(sampleRate * 2 * numOfChan);
+  setUint16(numOfChan * 2);
+  setUint16(16);
+  writeString('data');
+  setUint32(length - pos - 4);
+
+  for (let i = 0; i < buffer.numberOfChannels; i++) {
+    channels.push(buffer.getChannelData(i));
+  }
+
+  let offset = 0;
+  while (offset < buffer.length) {
+    for (let i = 0; i < numOfChan; i++) {
+      let sample = Math.max(-1, Math.min(1, channels[i][offset]));
+      sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0;
+      out.setInt16(pos, sample, true);
+      pos += 2;
+    }
+    offset++;
+  }
+
+  return new Blob([out], { type: 'audio/wav' });
+}
 
 export default function App() {
   const [upscaleMode, setUpscaleMode] = useState<UpscaleMode>(null);
@@ -167,17 +223,6 @@ export default function App() {
         canvasRefEnhanced.current.toBlob(async (blob) => {
           if (!blob) return;
           const fileName = `enhanced_anime4k.png`;
-          if (navigator.canShare) {
-            const file = new File([blob], fileName, { type: 'image/png' });
-            if (navigator.canShare({ files: [file] })) {
-              try {
-                await navigator.share({ files: [file], title: 'Enhanced Anime Image' });
-                return;
-              } catch (e) {
-                console.error('Error sharing:', e);
-              }
-            }
-          }
           const link = document.createElement('a');
           link.download = fileName;
           link.href = URL.createObjectURL(blob);
@@ -185,24 +230,30 @@ export default function App() {
         }, 'image/png');
       }
     } else {
+      if (videoFormat === 'wav') {
+        try {
+          const response = await fetch(fileUrl);
+          const arrayBuffer = await response.arrayBuffer();
+          const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+          const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+          const wavBlob = audioBufferToWav(audioBuffer);
+          const wavUrl = URL.createObjectURL(wavBlob);
+          const link = document.createElement('a');
+          link.download = `anime4k_extracted_audio.wav`;
+          link.href = wavUrl;
+          link.click();
+          setTimeout(() => URL.revokeObjectURL(wavUrl), 10000);
+          return;
+        } catch (e) {
+          console.error('Failed to extract WAV audio:', e);
+          alert('No audio track detected or could not extract WAV audio from video file.');
+          return;
+        }
+      }
+
       if (recordedBlobUrl) {
         const ext = videoFormat === 'mp4' ? 'mp4' : 'webm';
         const fileName = `enhanced_anime4k.${ext}`;
-        try {
-          const response = await fetch(recordedBlobUrl);
-          const blob = await response.blob();
-          const downloadBlob = new Blob([blob], { type: recordedMimeType });
-          
-          if (navigator.canShare) {
-            const file = new File([downloadBlob], fileName, { type: recordedMimeType });
-            if (navigator.canShare({ files: [file] })) {
-              await navigator.share({ files: [file], title: 'Enhanced Anime Video' });
-              return;
-            }
-          }
-        } catch (e) {
-          console.error('Error sharing:', e);
-        }
         const link = document.createElement('a');
         link.download = fileName;
         link.href = recordedBlobUrl;
@@ -304,7 +355,7 @@ export default function App() {
               }
               setRecordedMimeType(mimeType);
 
-              // Setup MediaRecorder capturing from the main canvas
+              // Setup MediaRecorder
               try {
                 recordedChunks.current = [];
                 const stream = canvas.captureStream(targetFps);
@@ -328,89 +379,33 @@ export default function App() {
                 console.error('MediaRecorder initialization failed:', err);
               }
 
-              // Try OffscreenCanvas transfer to Worker for off-thread WebGL processing
-              let worker: Worker | null = null;
-              let isOffscreenTransferred = false;
-              let fallbackUpscaler: any = null;
+              const VideoUpscalerClass = unwrap(VideoUpscaler);
+              const upscaler = new VideoUpscalerClass(preset, targetFps);
+              upscalerRef.current = upscaler;
+              upscaler.attachVideo(video, canvas);
+              upscaler.start();
 
-              const presetNameMap: Record<ModelMode, string> = {
-                'anime4k-a-fast': 'ANIME4K_HIGHEREND_MODE_A_FAST',
-                'anime4k-a': 'ANIME4K_HIGHEREND_MODE_A',
-                'anime4k-c': 'ANIME4K_HIGHEREND_MODE_C',
-                'gan-restore': 'Anime4K_Restore_GAN_UUL',
-              };
-
-              if (typeof (canvas as any).transferControlToOffscreen === 'function') {
-                try {
-                  const offscreen = (canvas as any).transferControlToOffscreen();
-                  worker = new Worker(new URL('./workers/upscaleWorker.ts', import.meta.url), { type: 'module' });
-                  upscalerRef.current = { stop: () => worker?.terminate() };
-
-                  worker.postMessage({
-                    type: 'init',
-                    canvas: offscreen,
-                    presetName: presetNameMap[model] || 'ANIME4K_HIGHEREND_MODE_A_FAST',
-                    denoise,
-                    width: video.videoWidth * 2,
-                    height: video.videoHeight * 2
-                  }, [offscreen]);
-
-                  isOffscreenTransferred = true;
-                } catch (err) {
-                  console.warn('OffscreenCanvas transfer failed, using fallback main thread rendering:', err);
-                  isOffscreenTransferred = false;
-                }
-              }
-
-              if (!isOffscreenTransferred) {
-                const VideoUpscalerClass = unwrap(VideoUpscaler);
-                fallbackUpscaler = new VideoUpscalerClass(preset, targetFps);
-                upscalerRef.current = fallbackUpscaler;
-                fallbackUpscaler.attachVideo(video, canvas);
-                fallbackUpscaler.start();
-              }
-
-              // Sync original video preview & send frame bitmaps to worker offscreen canvas
-              let isProcessingFrame = false;
-              const processFrameLoop = async () => {
-                if (!syncRunning || isCancelled) return;
-
-                const vw = video.videoWidth;
-                const vh = video.videoHeight;
-
-                if (canvasOrig && vw && vh) {
+              // Sync original canvas preview loop
+              const syncCanvas = () => {
+                if (!syncRunning) return;
+                if (canvasOrig && video) {
                   const ctx = canvasOrig.getContext('2d');
                   if (ctx) {
-                    if (canvasOrig.width !== vw || canvasOrig.height !== vh) {
-                      canvasOrig.width = vw;
-                      canvasOrig.height = vh;
-                      setFileDetails(prev => prev ? { ...prev, dimensions: `${vw} × ${vh}` } : null);
+                    const vw = video.videoWidth;
+                    const vh = video.videoHeight;
+                    if (vw && vh) {
+                      if (canvasOrig.width !== vw || canvasOrig.height !== vh) {
+                        canvasOrig.width = vw;
+                        canvasOrig.height = vh;
+                        setFileDetails(prev => prev ? { ...prev, dimensions: `${vw} × ${vh}` } : null);
+                      }
+                      ctx.drawImage(video, 0, 0, vw, vh);
                     }
-                    ctx.drawImage(video, 0, 0, vw, vh);
                   }
                 }
-
-                if (isOffscreenTransferred && worker && !isProcessingFrame && video.readyState >= 2) {
-                  try {
-                    isProcessingFrame = true;
-                    const bitmap = await createImageBitmap(video);
-                    worker.postMessage({
-                      type: 'processFrame',
-                      imageBitmap: bitmap,
-                      targetWidth: (vw || 640) * 2,
-                      targetHeight: (vh || 360) * 2
-                    }, [bitmap]);
-                  } catch (e) {
-                    console.warn('Frame bitmap creation error:', e);
-                  } finally {
-                    isProcessingFrame = false;
-                  }
-                }
-
-                requestAnimationFrame(processFrameLoop);
+                requestAnimationFrame(syncCanvas);
               };
-
-              requestAnimationFrame(processFrameLoop);
+              requestAnimationFrame(syncCanvas);
 
               video.muted = true;
               video.loop = false;
@@ -422,8 +417,7 @@ export default function App() {
                 if (isCancelled) return;
                 if (video.ended || video.currentTime >= video.duration) {
                   syncRunning = false;
-                  if (fallbackUpscaler) fallbackUpscaler.stop();
-                  if (worker) worker.postMessage({ type: 'destroy' });
+                  upscaler.stop();
                   setProgress(100);
                   setCurrentFrame(estimatedFrames);
                   setStatus('completed');
@@ -879,7 +873,7 @@ export default function App() {
                        {fileType === 'video' ? (
                          <div>
                            <label className="text-[11px] font-bold text-neutral-400 uppercase tracking-wider block mb-1.5">Output Container Format</label>
-                           <div className="grid grid-cols-2 gap-2">
+                           <div className="grid grid-cols-3 gap-2">
                              <button 
                                type="button"
                                onClick={() => setVideoFormat('mp4')}
@@ -895,6 +889,14 @@ export default function App() {
                              >
                                WebM Video (.webm)
                                <span className="block text-[10px] opacity-75 font-normal">VP9 Web Container</span>
+                             </button>
+                             <button 
+                               type="button"
+                               onClick={() => setVideoFormat('wav')}
+                               className={`px-3 py-2 rounded-xl text-xs font-bold transition-all text-center ${videoFormat === 'wav' ? 'bg-[#00d2ff] text-black ring-1 ring-[#00d2ff]' : 'bg-black/60 text-neutral-300 hover:bg-black/80 border border-white/5'}`}
+                             >
+                               WAV Audio (.wav)
+                               <span className="block text-[10px] opacity-75 font-normal">Extract WAV Track</span>
                              </button>
                            </div>
                          </div>
